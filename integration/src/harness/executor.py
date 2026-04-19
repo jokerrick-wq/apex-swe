@@ -151,6 +151,8 @@ class EvaluationExecutor:
         max_agent_timeout_sec = 1800  # Default: 30 minutes
         max_test_timeout_sec = None
 
+        process_checks = None
+
         if task_yaml_path.exists():
             try:
                 with open(task_yaml_path) as f:
@@ -158,7 +160,22 @@ class EvaluationExecutor:
                 instruction = task_data.get("instruction", instruction)
                 max_agent_timeout_sec = task_data.get("max_agent_timeout_sec")
                 max_test_timeout_sec = task_data.get("max_test_timeout_sec")
+                process_checks = task_data.get("process_checks")
             except Exception:
+                pass
+
+        # Load test_metadata.json for FAIL_TO_PASS / PASS_TO_PASS lists (Kosmos)
+        fail_to_pass: list[str] = []
+        pass_to_pass: list[str] = []
+        test_meta_path = task_dir / "test_metadata.json"
+        if test_meta_path.exists():
+            try:
+                with open(test_meta_path) as f:
+                    meta_data = json.load(f)
+                fail_to_pass = list(meta_data.get("FAIL_TO_PASS") or [])
+                pass_to_pass = list(meta_data.get("PASS_TO_PASS") or [])
+            except Exception:
+                # Malformed metadata is non-fatal; leave lists empty.
                 pass
 
         task_files = []
@@ -214,6 +231,11 @@ class EvaluationExecutor:
             max_agent_timeout_sec=max_agent_timeout_sec,
             max_test_timeout_sec=max_test_timeout_sec,
             max_steps=getattr(config, "max_steps", None),
+            process_checks=process_checks,
+            run_dir=config.runs_dir / config.run_id,
+            model=config.model.value if hasattr(config.model, "value") else str(config.model),
+            fail_to_pass=fail_to_pass,
+            pass_to_pass=pass_to_pass,
         )
 
     def _get_llm(

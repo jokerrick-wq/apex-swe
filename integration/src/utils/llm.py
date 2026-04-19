@@ -10,7 +10,7 @@ from litellm.exceptions import (
     AuthenticationError as LiteLLMAuthenticationError,
     ContextWindowExceededError as LiteLLMContextWindowExceededError,
 )
-from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
+from tenacity import before_sleep_log, retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from src.config import (
     ANTHROPIC_THINKING_BUDGETS,
@@ -91,6 +91,7 @@ class LiteLLM:
         self.api_key = api_key
         self.conversation_history: list[dict[str, Any]] = []
         self.total_tokens_used = 0
+        self._last_response_metadata: dict = {}
 
         # Set reasoning effort (explicit > config default > None)
         self.reasoning_effort = reasoning_effort
@@ -130,6 +131,7 @@ class LiteLLM:
         retry=retry_if_not_exception_type(
             (ContextLengthExceededError, OutputLengthExceededError, LiteLLMAuthenticationError)
         ),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def call(self, prompt: str, **kwargs) -> str:
         """Call the LLM with a prompt and return the response."""
@@ -164,10 +166,23 @@ class LiteLLM:
                     completion_kwargs["reasoning_effort"] = self.reasoning_effort
 
             response = litellm.completion(**completion_kwargs)
+            self._last_response_metadata = {
+                "cost_usd": float(getattr(response, "_hidden_params", {}).get("response_cost", 0.0) or 0.0),
+                "latency_ms": int(getattr(response, "_response_ms", 0) or 0),
+                "tokens_in": int(getattr(response.usage, "prompt_tokens", 0) if hasattr(response, "usage") else 0),
+                "tokens_out": int(getattr(response.usage, "completion_tokens", 0) if hasattr(response, "usage") else 0),
+            }
             return response.choices[0].message.content
 
         except LiteLLMContextWindowExceededError:
             raise ContextLengthExceededError
+        except (LiteLLMAuthenticationError, ContextLengthExceededError, OutputLengthExceededError):
+            raise  # Let these propagate without extra logging
+        except Exception as e:
+            logger.error(
+                f"LLM call failed for model={self.model_name}: {type(e).__name__}: {e}"
+            )
+            raise
 
     def count_tokens(self, messages: list[dict]) -> int:
         """Count tokens in messages."""
@@ -175,6 +190,10 @@ class LiteLLM:
             return litellm.utils.token_counter(self.model_name, messages)
         except Exception:
             return sum(len(str(msg.get("content", ""))) for msg in messages) // 4
+
+    def get_last_response_metadata(self) -> dict:
+        """Return metadata from the most recent call() (cost, latency, tokens). Empty if none."""
+        return dict(self._last_response_metadata)
 
     def add_to_conversation(self, user_message: str, assistant_message: str) -> None:
         """Add a user-assistant exchange to conversation history."""

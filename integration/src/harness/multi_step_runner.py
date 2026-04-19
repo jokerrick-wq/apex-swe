@@ -3,9 +3,11 @@
 import concurrent.futures
 import json
 import logging
+import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from pathlib import Path as _Path
 from typing import Any
 
 import psutil
@@ -27,7 +29,35 @@ from src.utils.harness_utils import (
     setup_task_environment,
 )
 
+# Wire common/ into sys.path for import. Safe to run multiple times.
+_REPO_ROOT = _Path(__file__).resolve().parent.parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from common.trajectory import TrajectoryWriter  # noqa: E402
+
 logger = logging.getLogger(__name__)
+
+
+def _ts_now() -> str:
+    """Return current UTC time as ISO-8601 string with 'Z' suffix."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _dedupe_prefix_forms(test_id: str) -> list:
+    """Return both the prefixed and non-prefixed forms of a test ID.
+
+    Pytest's test ID format varies depending on where pytest is invoked from
+    and the -v/-rA flags used. Some outputs prefix with "tests/", others don't.
+    This helper returns both forms so downstream lookups succeed regardless of
+    which form test_layers.json uses.
+    """
+    forms = {test_id}
+    if test_id.startswith("tests/"):
+        forms.add(test_id[len("tests/"):])
+    else:
+        forms.add("tests/" + test_id)
+    return list(forms)
 
 
 def _ensure_git_baseline(
@@ -140,6 +170,8 @@ class MultiStepRunner:
         monitor_memory: bool = True,
         log_level: str = "INFO",
         todo_tool_enabled: bool = False,
+        *,
+        trajectory_writer: "TrajectoryWriter | None" = None,
     ):
         """
         Initialize multi-step runner.
@@ -150,12 +182,224 @@ class MultiStepRunner:
             monitor_memory: Whether to monitor memory usage
             log_level: Logging level for execution logs
             todo_tool_enabled: Whether to enable the todo tool
+            trajectory_writer: Optional TrajectoryWriter for emitting trajectory events.
+                If None, emission helpers become no-ops.
         """
         self.llm = llm
         self.max_steps = max_steps
         self.monitor_memory = monitor_memory
         self.todo_tool_enabled = todo_tool_enabled
         self.log_level = log_level
+        self.trajectory_writer = trajectory_writer
+
+    def _emit_reasoning(
+        self,
+        *,
+        step: int,
+        content: str,
+        tokens_in: int,
+        tokens_out: int,
+        latency_ms: int,
+        cost_usd: float,
+        ts: str,
+    ) -> None:
+        if self.trajectory_writer is None:
+            return
+        self.trajectory_writer.write(
+            step=step,
+            ts=ts,
+            type="reasoning",
+            content=content,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            latency_ms=latency_ms,
+            cost_usd=cost_usd,
+        )
+
+    def _emit_tool_call(
+        self,
+        *,
+        step: int,
+        tool: str,
+        args: dict,
+        call_id: str,
+        ts: str,
+    ) -> None:
+        if self.trajectory_writer is None:
+            return
+        self.trajectory_writer.write(
+            step=step,
+            ts=ts,
+            type="tool_call",
+            tool=tool,
+            args=args,
+            call_id=call_id,
+        )
+
+    def _emit_tool_result(
+        self,
+        *,
+        step: int,
+        call_id: str,
+        status: str,
+        exit_code: int,
+        stdout_bytes: int,
+        content: str,
+        ts: str,
+    ) -> None:
+        if self.trajectory_writer is None:
+            return
+        self.trajectory_writer.write(
+            step=step,
+            ts=ts,
+            type="tool_result",
+            call_id=call_id,
+            status=status,
+            exit_code=exit_code,
+            stdout_bytes=stdout_bytes,
+            content=content,
+        )
+
+    def _emit_completion(
+        self,
+        *,
+        step: int,
+        signal: str,
+        total_tokens_in: int,
+        total_tokens_out: int,
+        total_cost_usd: float,
+        wall_time_s: float,
+        ts: str,
+    ) -> None:
+        if self.trajectory_writer is None:
+            return
+        self.trajectory_writer.write(
+            step=step,
+            ts=ts,
+            type="completion",
+            signal=signal,
+            total_tokens_in=total_tokens_in,
+            total_tokens_out=total_tokens_out,
+            total_cost_usd=total_cost_usd,
+            wall_time_s=wall_time_s,
+        )
+
+    def _collect_per_test_results(self, *, evaluation_result, task_context, trial_dir):
+        """Collect per-test results for layer evaluation.
+
+        Parses pytest per-test lines from evaluation_result['test_output'] and
+        executes any bash verifier scripts referenced in <task_dir>/test_layers.json.
+
+        Returns: (test_results: dict[str, str], test_durations_ms: dict[str, int],
+                  test_errors: dict[str, str])
+        """
+        import re as _re
+        import subprocess as _sp
+        import json as _json
+        import time as _time
+        from pathlib import Path as _Path
+
+        test_results: dict = {}
+        test_durations_ms: dict = {}
+        test_errors: dict = {}
+
+        # --- Source 1: Parse pytest per-test lines from evaluator stdout ---
+        output = (evaluation_result or {}).get("test_output", "") or ""
+
+        # pytest -rA output includes both:
+        #   "PASSED test_outputs.py::test_script_exists"
+        #   "FAILED test_outputs.py::test_name - error message"
+        # Test file prefix may or may not include "tests/" depending on how pytest is invoked.
+        # Use a non-zero-width trailing group to avoid finditer skipping alternate
+        # lines. The optional "- <err>" part requires a literal separator; without
+        # it the regex would match empty string and finditer advances by one
+        # character past the newline on each zero-width match, skipping the next line.
+        summary_pattern = _re.compile(
+            r"^(PASSED|FAILED|ERROR)\s+((?:tests/)?[\w/.\-]+\.py::[\w\[\]_.\-]+)(?:\s+-\s+(.+))?$",
+            _re.MULTILINE,
+        )
+        for match in summary_pattern.finditer(output):
+            status = match.group(1)
+            test_id = match.group(2)
+            err_text = (match.group(3) or "").strip()
+            # Store under both forms (with and without tests/ prefix) for robust lookup
+            for form in _dedupe_prefix_forms(test_id):
+                test_results[form] = status
+                test_durations_ms.setdefault(form, 0)
+                if status != "PASSED" and err_text:
+                    test_errors[form] = err_text[:500]
+
+        # Also handle the verbose per-line format (in case pytest -v is used):
+        #   "tests/test_outputs.py::test_script_exists PASSED   [  2%]"
+        verbose_pattern = _re.compile(
+            r"^((?:tests/)?[\w/.\-]+\.py::[\w\[\]_.\-]+)\s+(PASSED|FAILED|ERROR|SKIPPED)\b",
+            _re.MULTILINE,
+        )
+        for match in verbose_pattern.finditer(output):
+            test_id = match.group(1)
+            status = match.group(2)
+            if status == "SKIPPED":
+                continue
+            for form in _dedupe_prefix_forms(test_id):
+                # Don't overwrite an existing status from summary pattern
+                if form not in test_results:
+                    test_results[form] = status
+                    test_durations_ms.setdefault(form, 0)
+
+        # --- Source 2: Execute bash verifier scripts referenced in test_layers.json ---
+        task_dir = getattr(task_context, "task_dir", None)
+        if task_dir and trial_dir:
+            test_layers_path = _Path(task_dir) / "test_layers.json"
+            if test_layers_path.exists():
+                try:
+                    doc = _json.loads(test_layers_path.read_text())
+                    all_tests = []
+                    for layer in doc.get("layers", []):
+                        all_tests.extend(layer.get("tests", []))
+
+                    for test_id in sorted(set(all_tests)):
+                        if not test_id.endswith(".sh"):
+                            continue
+                        script_path = _Path(task_dir) / test_id
+                        if not script_path.exists():
+                            test_results[test_id] = "ERROR"
+                            test_errors[test_id] = f"verifier script not found: {script_path}"
+                            continue
+                        try:
+                            t0 = _time.monotonic()
+                            result = _sp.run(
+                                ["bash", str(script_path)],
+                                cwd=str(trial_dir),
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
+                            )
+                            dur_ms = int((_time.monotonic() - t0) * 1000)
+                            test_durations_ms[test_id] = dur_ms
+                            # Parse PASSED/FAILED from last non-empty stdout line
+                            last_line = ""
+                            for ln in reversed((result.stdout or "").strip().split("\n")):
+                                if ln.strip():
+                                    last_line = ln.strip()
+                                    break
+                            if last_line.startswith("PASSED"):
+                                test_results[test_id] = "PASSED"
+                            else:
+                                test_results[test_id] = "FAILED"
+                                err_detail = last_line or f"exit={result.returncode}"
+                                test_errors[test_id] = err_detail[:500]
+                        except _sp.TimeoutExpired:
+                            test_results[test_id] = "ERROR"
+                            test_errors[test_id] = "verifier timeout (30s)"
+                            test_durations_ms[test_id] = 30000
+                        except Exception as _e:
+                            test_results[test_id] = "ERROR"
+                            test_errors[test_id] = f"verifier exception: {_e}"
+                except Exception as _e:
+                    # test_layers.json parse failed; leave test_results as-is (partial)
+                    pass
+
+        return test_results, test_durations_ms, test_errors
 
     def calculate_max_memory(self, steps: list[dict[str, Any]]) -> int | None:
         """Calculate maximum memory usage across all steps."""
@@ -219,6 +463,27 @@ class MultiStepRunner:
             try:
                 requirements = docker_manager.get_required_mcp_requirements()
                 if requirements:
+                    # Filter requirements to only include services that are actually healthy
+                    healthy = docker_manager.get_healthy_services()
+                    if healthy:
+                        from src.config import SERVICES_WITH_MCP
+                        # Build reverse map: MCP token -> service names that produce it
+                        token_to_services = {}
+                        for svc, token in SERVICES_WITH_MCP.items():
+                            token_to_services.setdefault(token, []).append(svc)
+
+                        original_requirements = list(requirements)
+                        requirements = [
+                            req for req in requirements
+                            if any(svc in healthy for svc in token_to_services.get(req, []))
+                        ]
+                        skipped = set(original_requirements) - set(requirements)
+                        if skipped:
+                            msg = f"Skipping MCP requirements for unhealthy services: {', '.join(skipped)}"
+                            print(f"[MCP] ⚠️  {msg}")
+                            if logger:
+                                logger._log(msg)
+
                     print(f"Required MCP requirements: {', '.join(requirements)}")
                     if logger:
                         logger._log(f"Required MCP requirements: {', '.join(requirements)}")
@@ -230,9 +495,11 @@ class MultiStepRunner:
                 if logger:
                     logger._log(f"Failed to write mcp-required.txt: {e}")
 
-            # Wait for MCP config to be ready
+            # Wait for MCP config to be ready (5s intervals, 60 iterations = 5 min max)
             mcp_ready = False
-            for i in range(120):
+            max_polls = 60
+            poll_interval = 5
+            for i in range(max_polls):
                 try:
                     result = docker_manager._container.exec_run(
                         cmd=["sh", "-lc", "sh /app/wait-for-mcp-config.sh"]
@@ -243,22 +510,22 @@ class MultiStepRunner:
                             logger._log("MCP config is ready and task can begin")
                         break
                     else:
-                        print("MCP config is not ready, waiting for 10 seconds")
+                        print(f"MCP config is not ready, waiting for {poll_interval} seconds")
                         if logger:
-                            logger._log("MCP config is not ready, waiting for 10 seconds")
+                            logger._log(f"MCP config is not ready, waiting for {poll_interval} seconds")
                 except Exception as e:
                     if logger:
                         logger._log(f"⚠️ MCP config check failed: {e}")
-                if logger and i % 6 == 0:
+                if logger and i % 12 == 0:
                     logger._log(
-                        f"⏳ Waiting for API keys in MCP config to be ready... ({i + 1}/120)"
+                        f"⏳ Waiting for API keys in MCP config to be ready... ({i + 1}/{max_polls})"
                     )
-                time.sleep(10)
+                time.sleep(poll_interval)
 
             if not mcp_ready:
                 if logger:
-                    logger._log("MCP config not ready after 20 minutes, aborting task execution")
-                raise RuntimeError("MCP configuration not ready after 20 minutes")
+                    logger._log(f"MCP config not ready after {max_polls * poll_interval // 60} minutes, aborting task execution")
+                raise RuntimeError(f"MCP configuration not ready after {max_polls * poll_interval // 60} minutes")
 
         return git_ready
 
@@ -313,6 +580,7 @@ class MultiStepRunner:
 
         step_num = 0
         episode_task_logger = None
+        completion_signal = "task_complete"
 
         while True:
             step_num += 1
@@ -322,12 +590,14 @@ class MultiStepRunner:
             if elapsed_time > max_timeout:
                 if logger:
                     logger._log(f"Reached timeout limit ({max_timeout}s)")
+                completion_signal = "timeout"
                 break
 
             # Check max steps
             if effective_max_steps and step_num > effective_max_steps:
                 if logger:
                     logger._log(f"Reached maximum steps limit ({effective_max_steps})")
+                completion_signal = "max_steps"
                 break
 
             # Check token limits
@@ -379,6 +649,18 @@ class MultiStepRunner:
                 [{"role": "assistant", "content": response_content}]
             )
 
+            # Emit trajectory reasoning event
+            _llm_meta = self.llm.get_last_response_metadata() if hasattr(self.llm, "get_last_response_metadata") else {}
+            self._emit_reasoning(
+                step=step_num,
+                content=response_content,
+                tokens_in=_llm_meta.get("tokens_in") or input_tokens,
+                tokens_out=_llm_meta.get("tokens_out") or output_tokens,
+                latency_ms=_llm_meta.get("latency_ms", 0),
+                cost_usd=_llm_meta.get("cost_usd", 0.0),
+                ts=_ts_now(),
+            )
+
             response = {
                 "content": response_content,
                 "metadata": {
@@ -415,6 +697,30 @@ class MultiStepRunner:
             # Execute tools
             logs = []  # Local logs for this step
             tool_results = tool_executor.parse_and_execute_tools(response.get("content", ""), logs)
+
+            # Emit trajectory tool_call + tool_result for each tool
+            from uuid import uuid4 as _uuid4
+            for _tr in tool_results:
+                _call_id = f"c_{_uuid4().hex[:8]}"
+                _tool_name = _tr.get("tool", "unknown")
+                _call_args = _tr.get("call", {}) if isinstance(_tr.get("call"), dict) else {"raw": _tr.get("call")}
+                self._emit_tool_call(
+                    step=step_num,
+                    tool=_tool_name,
+                    args=_call_args,
+                    call_id=_call_id,
+                    ts=_ts_now(),
+                )
+                _result_str = str(_tr.get("result", ""))
+                self._emit_tool_result(
+                    step=step_num,
+                    call_id=_call_id,
+                    status="success",  # parse_and_execute_tools doesn't report status; default success
+                    exit_code=0,
+                    stdout_bytes=len(_result_str.encode("utf-8")),
+                    content=_result_str,
+                    ts=_ts_now(),
+                )
 
             if episode_task_logger and tool_results:
                 for tool_result in tool_results:
@@ -456,6 +762,22 @@ class MultiStepRunner:
                 break
 
         print("Agent completed.")
+
+        # Emit trajectory completion event
+        _wall_time = (datetime.now() - start_time).total_seconds()
+        # Sum totals from the steps list — steps[i]["agent_response"]["metadata"] has input/output tokens
+        _total_in = sum(s.get("agent_response", {}).get("metadata", {}).get("input_tokens", 0) for s in steps)
+        _total_out = sum(s.get("agent_response", {}).get("metadata", {}).get("output_tokens", 0) for s in steps)
+        # Cost: we don't track cumulative cost — use 0.0 for now (best-effort; single-call LLM cost is in last metadata)
+        self._emit_completion(
+            step=step_num + 1,
+            signal=completion_signal,
+            total_tokens_in=_total_in,
+            total_tokens_out=_total_out,
+            total_cost_usd=0.0,  # TODO: accumulate from per-step metadata in future task
+            wall_time_s=_wall_time,
+            ts=_ts_now(),
+        )
 
     def _post_execution_evaluation(
         self,
@@ -523,6 +845,100 @@ class MultiStepRunner:
         if task_logger:
             task_logger.log_evaluation_result(evaluation_result)
 
+        # Kosmos: write per-trial results.json alongside existing outputs.
+        # Coarse first pass — maps aggregate pass/fail onto all F2P/P2P test
+        # IDs uniformly. Per-test granularity is a future enhancement once the
+        # evaluator exposes individual test results.
+        trial_dir = getattr(self, "_kosmos_trial_dir", None)
+        if trial_dir is not None:
+            try:
+                # Collect per-test results from (1) pytest stdout and (2) bash verifier scripts
+                _test_results, _test_durations, _test_errors = self._collect_per_test_results(
+                    evaluation_result=evaluation_result,
+                    task_context=task_context,
+                    trial_dir=self._kosmos_trial_dir,
+                )
+
+                # Fallback for F2P/P2P test IDs that weren't covered above (legacy aggregate verdict)
+                _f2p = list(getattr(task_context, "fail_to_pass", []) or [])
+                _p2p = list(getattr(task_context, "pass_to_pass", []) or [])
+                _passed = bool(evaluation_result.get("passed", False))
+                _status = "PASSED" if _passed else "FAILED"
+                for _tid in _f2p + _p2p:
+                    if _tid not in _test_results:
+                        _test_results[_tid] = _status
+                        _test_durations.setdefault(_tid, 0)
+                if not _passed:
+                    _err_fallback = (evaluation_result.get("test_output") or "")[:500]
+                    for _tid in _f2p + _p2p:
+                        if _test_results.get(_tid) == "FAILED" and _tid not in _test_errors:
+                            _test_errors[_tid] = _err_fallback
+
+                # Derive completion signal from execution.status when possible.
+                _signal = "task_complete"
+                _status_value = getattr(execution, "status", None)
+                if _status_value is not None:
+                    _s = str(getattr(_status_value, "value", _status_value)).lower()
+                    if "timeout" in _s:
+                        _signal = "timeout"
+                    elif "error" in _s or "failed" in _s:
+                        _signal = "error"
+
+                _total_in = sum(
+                    s.get("agent_response", {}).get("metadata", {}).get("input_tokens", 0)
+                    for s in steps
+                )
+                _total_out = sum(
+                    s.get("agent_response", {}).get("metadata", {}).get("output_tokens", 0)
+                    for s in steps
+                )
+
+                evaluator.write_layer_results(
+                    task_dir=task_context.task_dir,
+                    trial_dir=trial_dir,
+                    trial=trial_number,
+                    task=task_context.task_id,
+                    model=getattr(task_context, "model", None) or "",
+                    wall_time_s=(datetime.now() - start_time).total_seconds(),
+                    total_cost_usd=0.0,  # TODO: accumulate from per-step metadata in future task
+                    total_tokens_in=_total_in,
+                    total_tokens_out=_total_out,
+                    completion_signal=_signal,
+                    f2p_tests=_f2p,
+                    p2p_tests=_p2p,
+                    test_results=_test_results,
+                    test_durations_ms=_test_durations,
+                    test_errors=_test_errors,
+                )
+            except Exception as _e:
+                if task_logger:
+                    task_logger._log(f"[kosmos] write_layer_results failed: {_e}")
+                elif logger:
+                    logger._log(f"[kosmos] write_layer_results failed: {_e}")
+
+        # Run process verification if task defines process_checks
+        process_checks = getattr(task_context, "process_checks", None)
+        if process_checks and task_logger:
+            if logger:
+                logger._log("Running process verification (tool-call log analysis)")
+            process_result = evaluator.evaluate_process(
+                task_logger.log_dir, process_checks
+            )
+            evaluation_result["process_verification"] = process_result
+
+            # Save process results alongside test results
+            try:
+                process_path = task_logger.log_dir / "process_results.json"
+                process_path.write_text(json.dumps(process_result, indent=2, default=str))
+                if logger:
+                    logger._log(
+                        f"Process verification: {process_result['passed']}/{process_result['total']} checks passed "
+                        f"({process_result['required_passed']}/{process_result['required_total']} required)"
+                    )
+            except Exception as e:
+                if logger:
+                    logger._log(f"Failed to write process_results.json: {e}")
+
         # Capture post-test artifacts
         terminal_manager.capture_pane_safely(tool_executor, task_logger, "post-test.txt")
         terminal_manager.copy_session_logs_safely(tool_executor, task_logger, "agent")
@@ -571,6 +987,24 @@ class MultiStepRunner:
         start_time = datetime.now()
         logs = []
         steps = []
+
+        # Wire Kosmos trajectory writer + per-trial results dir.
+        # The runner pool loans a runner to a single trial at a time, so setting
+        # self.trajectory_writer here is safe.
+        self._kosmos_trial_dir = None
+        try:
+            _run_dir = getattr(task_context, "run_dir", None)
+            if _run_dir is not None:
+                _trial_dir = Path(_run_dir) / f"trial_{trial_number:02d}"
+                _trial_dir.mkdir(parents=True, exist_ok=True)
+                self.trajectory_writer = TrajectoryWriter(_trial_dir / "trajectory.jsonl")
+                self._kosmos_trial_dir = _trial_dir
+            else:
+                self.trajectory_writer = None
+        except Exception:
+            # If anything fails, fall back to no writer — do not break the trial
+            self.trajectory_writer = None
+            self._kosmos_trial_dir = None
 
         # Determine max timeout
         max_timeout = float(task_context.timeout)
@@ -750,6 +1184,14 @@ class MultiStepRunner:
                 except Exception as e:
                     if "logs" in locals() and logs:
                         logs.append(f"Error cleaning up tools: {e}")
+            # Close Kosmos trajectory writer if it was opened.
+            if self.trajectory_writer is not None:
+                try:
+                    self.trajectory_writer.close()
+                except Exception:
+                    pass
+                finally:
+                    self.trajectory_writer = None
 
             if "docker_ctx" in locals() and docker_ctx:
                 try:

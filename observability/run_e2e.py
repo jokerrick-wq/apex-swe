@@ -6,19 +6,19 @@ Single Task:
     python run_e2e.py --task <task_id> --model <model_name>
 
 Multiple Tasks (Parallel):
-    python run_e2e.py --tasks task1 task2 --model <model> --parallel 4
-    python run_e2e.py --tasks-file tasks.txt --model <model> --parallel 6
-    python run_e2e.py --all --model <model> --parallel 4
+    python run_e2e.py --tasks task1 task2 --model <model> --workers 4
+    python run_e2e.py --tasks-file tasks.txt --model <model> --workers 6
+    python run_e2e.py --all --model <model> --workers 4
 
 Examples:
     # Single task
     python run_e2e.py --task crankyoldgit-irremoteesp8266-1733-1734-observability --model claude-opus-4-5
     
     # Multiple tasks in parallel
-    python run_e2e.py --tasks task1 task2 task3 --model claude-opus-4-5 --parallel 4
+    python run_e2e.py --tasks task1 task2 task3 --model claude-opus-4-5 --workers 4
     
     # All tasks with 3 trials each
-    python run_e2e.py --all --model claude-opus-4-5 --trials 3 --parallel 6
+    python run_e2e.py --all --model claude-opus-4-5 --trials 3 --workers 6
     
     # Resume interrupted run
     python run_e2e.py --all --model claude-opus-4-5 --output results/ --resume
@@ -483,7 +483,7 @@ def run_parallel_mode(args, all_tasks) -> int:
     print(f"Tasks:      {len(task_ids)}")
     print(f"Trials:     {args.trials}")
     print(f"Total runs: {len(work_items)}")
-    print(f"Workers:    {args.parallel}")
+    print(f"Workers:    {args.workers}")
     print(f"Output:     {output_dir}")
     print("=" * 70)
     
@@ -492,7 +492,7 @@ def run_parallel_mode(args, all_tasks) -> int:
     passed_count = sum(1 for r in results if r.passed)
     
     # Run in parallel
-    with ProcessPoolExecutor(max_workers=args.parallel) as executor:
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(
                 run_single_e2e,
@@ -550,7 +550,7 @@ def run_parallel_mode(args, all_tasks) -> int:
     total_elapsed = time.time() - start_time
     total_runs = len(results)
     pass_rate = passed_count / total_runs if total_runs > 0 else 0
-    
+
     print("\n" + "=" * 70)
     print("Summary")
     print("=" * 70)
@@ -561,7 +561,34 @@ def run_parallel_mode(args, all_tasks) -> int:
     print(f"Total time:   {total_elapsed/60:.1f} minutes")
     print(f"Results:      {output_dir}/results.json")
     print("=" * 70)
-    
+
+    # Kosmos post-dispatch aggregation (best-effort)
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _REPO = _Path(__file__).resolve().parent.parent
+        if str(_REPO) not in _sys.path:
+            _sys.path.insert(0, str(_REPO))
+        from common.trials import aggregate_trials, write_eval_summary
+
+        # The path where per-trial results.json files would live — for
+        # observability, the existing scorer writes to
+        # EVAL_OUTPUTS_DIR / <task_id> / <run_id> / trial_NN / (Task 15 wiring)
+        # but the scorer doesn't yet produce results.json per trial (Task 16
+        # provides the function but it's not wired into the scorer body).
+        # aggregate_trials will skip gracefully with a warning when no
+        # results.json files are present.
+        _run_dir = output_dir if output_dir.exists() else None
+        if _run_dir:
+            try:
+                _agg = aggregate_trials(_run_dir)
+                write_eval_summary(_run_dir, _agg)
+                print(f"[kosmos] Wrote {_run_dir / 'eval_summary.md'}", file=_sys.stderr)
+            except ValueError as _exc:
+                print(f"[kosmos] Could not aggregate: {_exc}", file=_sys.stderr)
+    except Exception as _exc:
+        print(f"[kosmos] Aggregation setup failed: {_exc}", file=_sys.stderr)
+
     return 0
 
 
@@ -575,10 +602,10 @@ Examples:
   python run_e2e.py --task my-task --model claude-opus-4-5
   
   # Multiple tasks (parallel)
-  python run_e2e.py --tasks task1 task2 --model claude-opus-4-5 --parallel 4
+  python run_e2e.py --tasks task1 task2 --model claude-opus-4-5 --workers 4
   
   # All tasks
-  python run_e2e.py --all --model claude-opus-4-5 --parallel 6
+  python run_e2e.py --all --model claude-opus-4-5 --workers 6
   
   # Resume interrupted run
   python run_e2e.py --all --model claude-opus-4-5 --resume
@@ -617,11 +644,18 @@ Examples:
     parser.add_argument("--skip-health-check", action="store_true", help="Skip pre-flight health checks")
     
     # Parallel mode options
-    parser.add_argument("--parallel", "-p", type=int, default=1, help="Number of parallel workers (default: 1)")
+    parser.add_argument("--workers", "--parallel", "-p", type=int, default=1,
+                        dest="workers",
+                        help="Number of parallel workers (default: 1). Formerly --parallel.")
     parser.add_argument("--resume", action="store_true", help="Resume from previous run (parallel mode)")
-    
+
     args = parser.parse_args()
-    
+
+    # Deprecation shim for --parallel flag
+    if any(a == "--parallel" or a.startswith("--parallel=") for a in sys.argv):
+        print("[DEPRECATED] --parallel will be removed in a future release; "
+              "use --workers instead.", file=sys.stderr)
+
     # Import eval_runner
     from eval_runner import get_all_task_ids, get_logger, set_log_level
     
@@ -635,7 +669,7 @@ Examples:
     all_tasks = get_all_task_ids()
     
     # Determine mode: single vs parallel
-    is_single_mode = args.task is not None and args.parallel == 1
+    is_single_mode = args.task is not None and args.workers == 1
     
     if is_single_mode:
         exit_code = run_single_mode(args, logger, all_tasks)

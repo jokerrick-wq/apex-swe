@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import shlex
 from datetime import datetime
 from pathlib import Path
@@ -47,7 +48,63 @@ from eval_runner.config import (
 from parser.frameworks import get_test_command_with_output
 from parser.eval_utils import parse_test_results, TestResults, TaskInstance
 
+# Wire common/ into sys.path for Kosmos instrumentation
+import sys as _sys
+from pathlib import Path as _Path
+_REPO_ROOT = _Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
+from common.layers import LayerEvaluator  # noqa: E402
+
 logger = get_logger(__name__)
+
+
+def write_layer_results_for_trial(
+    *,
+    task_dir,
+    trial_dir,
+    trial: int,
+    task: str,
+    model: str,
+    wall_time_s: float,
+    total_cost_usd: float,
+    total_tokens_in: int,
+    total_tokens_out: int,
+    completion_signal: str,
+    f2p_tests,
+    p2p_tests,
+    test_results,
+    test_durations_ms,
+    test_errors,
+) -> None:
+    """Produce trial_dir/results.json using LayerEvaluator.
+
+    If task_dir/test_layers.json exists, uses it; otherwise falls back to
+    F2P/P2P layers. Tests missing from test_results are marked ERROR.
+    """
+    evaluator = LayerEvaluator(
+        task_dir=task_dir,
+        f2p_tests=list(f2p_tests),
+        p2p_tests=list(p2p_tests),
+    )
+    layers = evaluator.load_layers()
+    evaluated = evaluator.evaluate(
+        layers, test_results, test_durations_ms, test_errors,
+    )
+    _Path(trial_dir).mkdir(parents=True, exist_ok=True)
+    evaluator.write_results(
+        _Path(trial_dir) / "results.json",
+        trial=trial,
+        task=task,
+        model=model,
+        wall_time_s=wall_time_s,
+        total_cost_usd=total_cost_usd,
+        total_tokens_in=total_tokens_in,
+        total_tokens_out=total_tokens_out,
+        completion_signal=completion_signal,
+        layers=evaluated,
+    )
 
 
 def extract_test_patch_targets(patch_content: str) -> tuple[list[str], list[str]]:
@@ -102,6 +159,75 @@ def extract_test_patch_targets(patch_content: str) -> tuple[list[str], list[str]
         i += 1
     
     return existing_files, new_files
+
+
+def evaluate_process_from_messages(
+    state: TaskState,
+    process_checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Analyze agent conversation messages for expected service interactions.
+
+    Extracts all text from the inspect-ai TaskState messages (including tool
+    call commands and tool results) and checks for evidence of service usage.
+
+    Args:
+        state: The inspect-ai TaskState containing conversation messages
+        process_checks: List of check dicts with service, description, required, pattern
+
+    Returns:
+        Dict with checks, totals, and pass/fail summary
+    """
+    # Serialize all messages to a single searchable string
+    parts: list[str] = []
+    for msg in getattr(state, "messages", []):
+        # Handle string content
+        content = getattr(msg, "content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                else:
+                    # ContentBlock objects — extract text/tool_call fields
+                    parts.append(str(block))
+        # Also capture tool_calls on assistant messages
+        for tc in getattr(msg, "tool_calls", []) or []:
+            parts.append(str(tc))
+    combined = " ".join(parts).lower()
+
+    results = []
+    for check in process_checks:
+        service = check.get("service", "").lower()
+        description = check.get("description", f"Agent interacted with {service}")
+        required = check.get("required", True)
+        pattern = check.get("pattern", "")
+
+        found = service in combined
+        if found and pattern:
+            found = bool(re.search(pattern.lower(), combined))
+
+        results.append({
+            "service": service,
+            "description": description,
+            "required": required,
+            "passed": found,
+        })
+
+    total = len(results)
+    passed = sum(1 for r in results if r["passed"])
+    required_checks = [r for r in results if r["required"]]
+    required_passed = sum(1 for r in required_checks if r["passed"])
+    required_total = len(required_checks)
+
+    return {
+        "checks": results,
+        "total": total,
+        "passed": passed,
+        "required_passed": required_passed,
+        "required_total": required_total,
+        "all_required_passed": required_passed == required_total,
+    }
 
 
 def save_run_outputs(
@@ -264,15 +390,61 @@ def unified_scorer(
                         )
                 
                 await sandbox().write_file("/app/test.patch", test_patch_content)
+
+                # Strategy 1: git apply (strict)
                 apply_result = await sandbox().exec(
                     ["bash", "-c", "cd /app/repo && git apply /app/test.patch 2>&1"],
                     timeout=TIMEOUTS.git_apply,
                 )
                 if apply_result.success:
                     test_patch_applied = True
-                else:
-                    test_patch_error = apply_result.stdout or apply_result.stderr or "Unknown error"
-                    task_logger.error(f"Test patch failed to apply: {test_patch_error}")
+                    task_logger.info("Test patch applied with git apply (strict)")
+
+                # Strategy 2: git apply --3way (needs blob SHAs in repo)
+                if not test_patch_applied:
+                    await sandbox().exec(
+                        ["bash", "-c", "cd /app/repo && git checkout HEAD -- . 2>&1 || true"],
+                        timeout=TIMEOUTS.git_checkout,
+                    )
+                    apply_result = await sandbox().exec(
+                        ["bash", "-c", "cd /app/repo && git apply --3way /app/test.patch 2>&1"],
+                        timeout=TIMEOUTS.git_apply,
+                    )
+                    if apply_result.success:
+                        test_patch_applied = True
+                        task_logger.info("Test patch applied with git apply --3way")
+                    else:
+                        check = await sandbox().exec(
+                            ["bash", "-c", "cd /app/repo && git diff --name-only 2>&1"],
+                            timeout=TIMEOUTS.git_apply,
+                        )
+                        if check.success and check.stdout.strip():
+                            task_logger.warning(
+                                f"Test patch 3-way merge had conflicts but produced changes: {check.stdout.strip()}"
+                            )
+                            await sandbox().exec(
+                                ["bash", "-c", "cd /app/repo && git checkout --theirs . 2>&1 && git add -A 2>&1"],
+                                timeout=TIMEOUTS.git_apply,
+                            )
+                            test_patch_applied = True
+                            task_logger.info("Test patch applied with --3way conflict resolution")
+
+                # Strategy 3: patch -p1 (line-based, ignores blob SHAs, tolerates fuzz)
+                if not test_patch_applied:
+                    await sandbox().exec(
+                        ["bash", "-c", "cd /app/repo && git checkout HEAD -- . 2>&1 || true"],
+                        timeout=TIMEOUTS.git_checkout,
+                    )
+                    apply_result = await sandbox().exec(
+                        ["bash", "-c", "cd /app/repo && patch -p1 --fuzz=3 --force < /app/test.patch 2>&1"],
+                        timeout=TIMEOUTS.git_apply,
+                    )
+                    if apply_result.success:
+                        test_patch_applied = True
+                        task_logger.info(f"Test patch applied with patch -p1: {apply_result.stdout.strip()}")
+                    else:
+                        test_patch_error = apply_result.stdout or apply_result.stderr or "Unknown error"
+                        task_logger.error(f"Test patch failed all strategies: {test_patch_error}")
         except Exception as e:
             test_patch_error = str(e)
             task_logger.error(f"Exception applying test patch: {e}")
@@ -525,28 +697,51 @@ done
             },
         )
 
+        # Process verification: check agent interacted with required services
+        process_verification = None
+        try:
+            process_checks = metadata.get("process_checks")
+            if not process_checks and task_dir:
+                import yaml
+                task_yaml_path = Path(task_dir) / "task.yaml"
+                if task_yaml_path.exists():
+                    task_yaml = yaml.safe_load(task_yaml_path.read_text(encoding="utf-8"))
+                    process_checks = task_yaml.get("process_checks")
+            if process_checks:
+                process_verification = evaluate_process_from_messages(state, process_checks)
+                task_logger.info(
+                    f"Process verification: {process_verification['passed']}/{process_verification['total']} checks passed "
+                    f"(required: {process_verification['required_passed']}/{process_verification['required_total']})"
+                )
+        except Exception as e:
+            task_logger.warning(f"Process verification failed: {e}")
+
+        score_metadata = {
+            "task_id": task_id,
+            "run_id": run_id,
+            "passed_required": passed_required,
+            "failed_required": failed_required,
+            "missing_required": missing_required,
+            "regressed_tests": regressed_tests,
+            "total_parsed": len(test_results.parsed_results),
+            "exit_code": test_exit_code,
+            "f2p_from_cache": f2p_from_cache,
+            "f2p_count": test_results.f2p_total,
+            "p2p_count": test_results.p2p_total,
+            "p2p_passed": test_results.p2p_passed,
+            "agent_diff": agent_diff,
+            "changed_files": changed_files,
+            "test_patch_applied": test_patch_applied,
+            "output_dir": output_dir,
+        }
+        if process_verification:
+            score_metadata["process_verification"] = process_verification
+
         return Score(
             value=score_value,
             answer=f"{test_results.f2p_passed}/{test_results.f2p_total} FAIL_TO_PASS tests passed",
             explanation="\n".join(explanation_parts),
-            metadata={
-                "task_id": task_id,
-                "run_id": run_id,
-                "passed_required": passed_required,
-                "failed_required": failed_required,
-                "missing_required": missing_required,
-                "regressed_tests": regressed_tests,
-                "total_parsed": len(test_results.parsed_results),
-                "exit_code": test_exit_code,
-                "f2p_from_cache": f2p_from_cache,
-                "f2p_count": test_results.f2p_total,
-                "p2p_count": test_results.p2p_total,
-                "p2p_passed": test_results.p2p_passed,
-                "agent_diff": agent_diff,
-                "changed_files": changed_files,
-                "test_patch_applied": test_patch_applied,
-                "output_dir": output_dir,
-            },
+            metadata=score_metadata,
         )
 
     return score
