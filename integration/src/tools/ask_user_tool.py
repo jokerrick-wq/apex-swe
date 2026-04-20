@@ -2,11 +2,18 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
-from common.kb import respond_as_persona
-from common.rubric_schema import KnowledgeBase, load_knowledge_base
+# Wire common/ into sys.path. Mirrors the pattern in multi_step_runner.py.
+# Needed because this tool module is imported before the runner's own wiring runs.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from common.kb import respond_as_persona  # noqa: E402
+from common.rubric_schema import KnowledgeBase, load_knowledge_base  # noqa: E402
 
 
 def _default_persona_model() -> str:
