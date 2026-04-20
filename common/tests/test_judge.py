@@ -82,9 +82,11 @@ def test_grade_writes_audit_files(tmp_path):
     assert "prompt" in data and "raw_response" in data and "parsed_judgment" in data
 
 
-def test_grade_missing_artifact_auto_fails():
-    # artifacts list contains a non-existent file; grade accepts solution_text directly
-    # so missing-artifact behavior is surfaced by the caller. Here we verify an empty
-    # solution_text still produces a result (engine doesn't crash).
+def test_grade_with_empty_solution_text():
+    # grade() accepts solution_text as a string; artifact resolution is the caller's
+    # responsibility (see Tasks 9-10). Here we verify the engine tolerates an empty
+    # solution without crashing and still applies the LLM judgment to each criterion.
     result = grade(_rubric(), "", _always_pass)
     assert result.total == 2
+    assert result.passed == 2
+    assert result.score == 1.0
