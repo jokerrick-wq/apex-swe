@@ -1174,6 +1174,105 @@ def check_docker_image_exists(task_id: str) -> HealthCheckResult:
         )
 
 
+def check_docker_image_freshness(task_id: str) -> HealthCheckResult:
+    """Warn if the task's Docker image is older than any source file the image bakes in.
+
+    This catches the 'stale image' trap: if someone edits `repo/`, `Dockerfile`, `task.yaml`,
+    or other task files and the harness reuses a previously-built image, the container will
+    have the OLD files baked in. The patches applied at eval time will then land on stale
+    content (e.g. test.patch appending onto an already-patched file → duplicate symbols).
+
+    If stale, the message includes the exact `docker rmi` command to force a rebuild.
+    """
+    image_name = get_docker_image_name(task_id)
+    task_dir = TASKS_DIR / task_id
+
+    try:
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Created}}", image_name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+        if inspect.returncode != 0:
+            # No image — fresh build will happen. Not stale.
+            return HealthCheckResult(
+                name="docker_image_freshness",
+                passed=True,
+                message=f"No existing image for {task_id}; will build fresh.",
+            )
+
+        # Parse image created time (ISO 8601, e.g. 2026-04-20T10:22:44.1234Z)
+        import datetime
+        created_raw = inspect.stdout.strip()
+        # Strip nanoseconds beyond microsecond precision if present; Python fromisoformat
+        # can't handle Docker's 9-digit fractional seconds.
+        if "." in created_raw:
+            head, tail = created_raw.split(".", 1)
+            frac = "".join(c for c in tail if c.isdigit())[:6]
+            suffix = "".join(c for c in tail if not c.isdigit())
+            created_raw = f"{head}.{frac}{suffix}"
+        created_raw = created_raw.replace("Z", "+00:00")
+        image_created = datetime.datetime.fromisoformat(created_raw)
+
+        # Find the newest source file under task_dir that the image bakes in.
+        # Skip paths that are bind-mounted at runtime or written during runs — mtime
+        # changes on those don't reflect image staleness.
+        excluded_parts = {"data", "observability", ".git", "__pycache__", ".pytest_cache"}
+        excluded_suffixes = {".log", ".pyc", ".pyo"}
+        newest_mtime = 0.0
+        newest_file = ""
+        if task_dir.exists():
+            for path in task_dir.rglob("*"):
+                if not path.is_file():
+                    continue
+                parts = set(path.relative_to(task_dir).parts)
+                if parts & excluded_parts:
+                    continue
+                if path.suffix in excluded_suffixes:
+                    continue
+                try:
+                    mtime = path.stat().st_mtime
+                    if mtime > newest_mtime:
+                        newest_mtime = mtime
+                        newest_file = str(path.relative_to(task_dir))
+                except OSError:
+                    continue
+
+        newest_dt = datetime.datetime.fromtimestamp(newest_mtime, tz=datetime.timezone.utc)
+
+        if newest_mtime > image_created.timestamp():
+            return HealthCheckResult(
+                name="docker_image_freshness",
+                passed=False,
+                message=(
+                    f"STALE IMAGE: {image_name} was built {image_created.isoformat()} but "
+                    f"task file {newest_file} was modified {newest_dt.isoformat()}. "
+                    f"The container will contain OUTDATED source. "
+                    f"Run: docker rmi -f {image_name}"
+                ),
+                details={
+                    "image": image_name,
+                    "image_created": image_created.isoformat(),
+                    "newest_source_file": newest_file,
+                    "newest_source_mtime": newest_dt.isoformat(),
+                },
+            )
+
+        return HealthCheckResult(
+            name="docker_image_freshness",
+            passed=True,
+            message=f"Image {image_name} is fresher than task source (newest: {newest_file}).",
+        )
+    except Exception as e:
+        return HealthCheckResult(
+            name="docker_image_freshness",
+            passed=True,  # Don't block on our check's own bugs
+            message=f"Freshness check skipped: {e}",
+        )
+
+
 def check_api_key(provider: str) -> HealthCheckResult:
     """Check if API key is configured for a provider."""
     key_vars = {
@@ -1235,6 +1334,7 @@ def run_health_checks(
     if task_id:
         results.append(check_task_exists(task_id))
         results.append(check_docker_image_exists(task_id))
+        results.append(check_docker_image_freshness(task_id))
     
     # Check API key if model specified
     if model:
