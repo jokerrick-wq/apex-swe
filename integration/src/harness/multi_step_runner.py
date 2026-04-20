@@ -409,15 +409,11 @@ class MultiStepRunner:
             return None
 
     def check_completion_indication(self, content: str) -> bool:
-        """Check if agent indicates task completion."""
-        xml_completion_tags = [
-            "<task_complete>true</task_complete>",
-            "task_complete>true<",
-            "task_complete>true",
-        ]
+        """Deprecated: retained for backwards-compatibility of callers; always returns False.
 
-        content_lower = content.lower()
-        return any(tag in content_lower for tag in xml_completion_tags)
+        Completion is now signaled by the submit_answer tool being invoked.
+        """
+        return False
 
     def _setup_docker_environment(self, task_context, max_timeout, docker_ctx, logger, task_logger):
         """
@@ -750,13 +746,14 @@ class MultiStepRunner:
             )
 
             # Check for completion
-            if self.check_completion_indication(response.get("content", "")):
+            if tool_executor.submit_answer_tool is not None and tool_executor.submit_answer_tool.submitted:
                 if task_logger:
                     task_logger.log_agent_action(
                         "completion",
                         {
                             "step": step_num - 1,
-                            "reason": "explicit_completion",
+                            "reason": "submit_answer",
+                            "summary": tool_executor.submit_answer_tool.summary,
                         },
                     )
                 break
@@ -1045,10 +1042,27 @@ class MultiStepRunner:
             git_ready = self._setup_git_and_mcp(docker_manager, task_context, logger, task_logger)
 
             # Phase 3: Initialize tools and terminal manager
+            from src.tools.ask_user_tool import AskUserTool
+            from src.tools.submit_answer_tool import SubmitAnswerTool
+
+            ask_user_tool = None
+            try:
+                ask_user_tool = AskUserTool.from_task_dir(task_context.task_dir)
+            except FileNotFoundError:
+                if task_logger:
+                    task_logger._log(f"No knowledge_base.json in {task_context.task_dir}; ask_user tool disabled")
+            except Exception as e:
+                if task_logger:
+                    task_logger._log(f"Failed to load knowledge base: {e}; ask_user tool disabled")
+
+            submit_answer_tool = SubmitAnswerTool()
+
             tool_executor = ToolExecutor(
                 working_dir,
                 docker_manager=docker_manager,
                 todo_tool_enabled=self.todo_tool_enabled,
+                ask_user_tool=ask_user_tool,
+                submit_answer_tool=submit_answer_tool,
             )
 
             terminal_manager = TerminalSessionManager(docker_manager.container)

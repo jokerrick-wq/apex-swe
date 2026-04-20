@@ -8,6 +8,7 @@ from typing import Any
 
 from .ask_user_tool import AskUserTool
 from .file_tool import FileTool
+from .submit_answer_tool import SubmitAnswerTool
 from .terminal_tool import TerminalTool
 from .todo_tool import TodoTool
 from src.utils.logging_utils import get_logger
@@ -21,6 +22,7 @@ class ToolExecutor:
         docker_manager=None,
         todo_tool_enabled: bool = False,
         ask_user_tool: AskUserTool | None = None,
+        submit_answer_tool: SubmitAnswerTool | None = None,
     ):
         """Initialize tool executor."""
         self.working_dir = working_dir or Path.cwd()
@@ -32,13 +34,13 @@ class ToolExecutor:
             if docker_manager
             else None,
         }
-
         if todo_tool_enabled:
             self.tools["todo"] = TodoTool()
-
         if ask_user_tool is not None:
             self.tools["ask_user"] = ask_user_tool
-
+        if submit_answer_tool is not None:
+            self.tools["submit_answer"] = submit_answer_tool
+        self.submit_answer_tool = submit_answer_tool
         self.execution_history = []
 
     def execute(self, tool_name: str, **kwargs) -> dict[str, Any]:
@@ -105,6 +107,9 @@ class ToolExecutor:
         if tool_name == "ask_user":
             question = tool_call.get("question", "")
             return self.execute("ask_user", question=question)
+        if tool_name == "submit_answer":
+            summary = tool_call.get("summary", "")
+            return self.execute("submit_answer", summary=summary)
         if tool_name == "terminal":
             command = tool_call.get("command", "")
             timeout = tool_call.get("timeout", 120)
@@ -355,6 +360,8 @@ class ToolExecutor:
                         logger._log(f"Blocking command completed in {duration:.2f}s.")
                 elif tool_name == "ask_user":
                     result = self.execute("ask_user", question=tool_call.get("question", ""))
+                elif tool_name == "submit_answer":
+                    result = self.execute("submit_answer", summary=tool_call.get("summary", ""))
                 elif tool_name == "todo":
                     # Extract params excluding 'tool' and 'action'
                     action = tool_call.get("action")
