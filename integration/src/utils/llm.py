@@ -16,6 +16,7 @@ from src.config import (
     ANTHROPIC_THINKING_BUDGETS,
     DEFAULT_TEMPERATURE,
     GEMINI_THINKING_BUDGETS,
+    MODELS_DEPRECATING_TEMP,
     MODELS_NOT_SUPPORTING_TEMP,
     MODELS_SUPPORTING_REASONING,
     REQUIRED_TEMPERATURE_1_0,
@@ -164,6 +165,12 @@ class LiteLLM:
                 else:
                     # OpenAI, xAI: use reasoning_effort directly
                     completion_kwargs["reasoning_effort"] = self.reasoning_effort
+
+            # Models that have deprecated the temperature parameter entirely — strip it
+            # regardless of what earlier blocks set. Must be last so it wins over any
+            # thinking/reasoning-related temperature=1.0 assignment above.
+            if self.model_name in MODELS_DEPRECATING_TEMP:
+                completion_kwargs.pop("temperature", None)
 
             response = litellm.completion(**completion_kwargs)
             self._last_response_metadata = {

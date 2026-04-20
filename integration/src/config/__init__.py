@@ -11,6 +11,13 @@ MODELS_NOT_SUPPORTING_TEMP = [
     "gpt-5.4",
 ]
 
+# Models that have deprecated the temperature parameter entirely — the kwarg
+# must be omitted from litellm.completion(...) calls. Distinct from the list
+# above, whose models require an explicit temperature=1.0.
+MODELS_DEPRECATING_TEMP = [
+    "claude-opus-4-7",
+]
+
 # Models that support extended thinking / reasoning
 # Maps model prefix -> default reasoning effort level
 MODELS_SUPPORTING_REASONING = {
