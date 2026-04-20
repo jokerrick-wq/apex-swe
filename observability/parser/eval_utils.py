@@ -274,9 +274,28 @@ fi'''
 
         script_parts.append("")
 
+    # Apply test patch FIRST (establishes new test files against the base repo),
+    # then golden patch on top. This matches docker_runner.py's agent-run sequence
+    # and avoids the 3-way-merge duplication that happened when test.patch was
+    # applied after golden.patch shifted surrounding context.
+    script_parts.append("# Create and apply test patch")
+    script_parts.append(_generate_base64_patch_apply_script(instance.test_patch, "test"))
+    script_parts.append(
+        f'''
+cd {workdir}
+echo "=== Applying test patch ==="
+git apply /tmp/test.patch 2>/tmp/test_error.txt || {{
+    echo "ERROR: Failed to apply test patch"
+    cat /tmp/test_error.txt
+    exit 1
+}}
+echo "Test patch applied successfully"
+'''
+    )
+
     # Apply golden patch if requested (for golden patch testing mode)
     if apply_golden_patch:
-        script_parts.append("# Apply golden patch")
+        script_parts.append("# Apply golden patch on top of test patch")
         script_parts.append(
             _generate_base64_patch_apply_script(instance.golden_patch, "golden")
         )
@@ -292,22 +311,6 @@ git apply /tmp/golden.patch 2>/tmp/golden_error.txt || {{
 echo "Golden patch applied successfully"
 '''
         )
-
-    # Create and apply test patch
-    script_parts.append("# Create and apply test patch")
-    script_parts.append(_generate_base64_patch_apply_script(instance.test_patch, "test"))
-    script_parts.append(
-        f'''
-cd {workdir}
-echo "=== Applying test patch ==="
-
-# Try to apply test patch with 3-way merge
-# This allows partial success if golden patch already modified some files
-git apply -3 /tmp/test.patch 2>&1 || true
-
-echo "Test patch applied"
-'''
-    )
 
     return "\n".join(script_parts)
 
