@@ -41,9 +41,10 @@ from typing import Any, Optional
 import os
 import yaml
 from inspect_ai import Task, eval as inspect_eval
-from inspect_ai.agent import AgentPrompt, react
+from inspect_ai.agent import AgentPrompt, AgentSubmit, react
 from inspect_ai.dataset import MemoryDataset, Sample
 from inspect_ai.tool import bash
+from inspect_ai.util import store
 
 from eval_runner.logger import get_logger, get_task_logger
 from eval_runner.config import (
@@ -72,8 +73,10 @@ from eval_runner.inspect_scorer import unified_scorer
 
 from agent.prompts.system_prompt import build_observability_prompt
 from agent.tools.apply_patch import apply_patch
+from agent.tools.ask_user import ask_user, load_kb_for_sample, KB_STORE_KEY
 from agent.tools.read_file import read_file
 from agent.tools.search_files import search_files
+from agent.tools.submit_answer import submit_answer
 from agent.tools.update_plan import update_plan
 
 # Add observability to path for sibling package imports (parser, agent)
@@ -485,7 +488,17 @@ def run_agent_sync(
             task_id=task_id,
             task_metadata=metadata,
         )
-        
+
+        # Kosmos: load KB for the task. If absent, ask_user works as a no-op fallback.
+        try:
+            kb = load_kb_for_sample(task_dir)
+        except FileNotFoundError:
+            kb = None
+            task_logger.warning(f"No knowledge_base.json in {task_dir}; ask_user will return unavailable")
+        except Exception as e:
+            kb = None
+            task_logger.warning(f"Failed to load knowledge base from {task_dir}: {e}; ask_user will return unavailable")
+
         # Configure tools
         tools = [
             apply_patch(),
@@ -493,8 +506,9 @@ def run_agent_sync(
             read_file(),
             search_files(),
             update_plan(),
+            ask_user(kb=kb),
         ]
-        
+
         # Create agent
         agent = react(
             name="apex_observability_agent",
@@ -503,6 +517,7 @@ def run_agent_sync(
                 assistant_prompt=None,
             ),
             tools=tools,
+            submit=AgentSubmit(tool=submit_answer(), name="submit_answer"),
         )
         
         # Create sample with run_id for tracking
