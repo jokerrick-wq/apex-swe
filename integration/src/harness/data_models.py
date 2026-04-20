@@ -44,6 +44,7 @@ class ModelType(str, Enum):
     KIMI_K2P5 = "fireworks_ai/accounts/fireworks/models/kimi-k2p5"
 
     CLAUDE_OPUS_4_6 = "claude-opus-4-6"
+    CLAUDE_OPUS_4_7 = "claude-opus-4-7"
     GPT5_2 = "gpt-5.2"
     GPT5_2_CODEX = "gpt-5.2-codex"
     GPT5_3 = "gpt-5.3"

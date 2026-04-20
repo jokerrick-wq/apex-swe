@@ -143,6 +143,11 @@ class ModelConfig:
 # All available models
 MODELS: dict[str, ModelConfig] = {
     # Anthropic
+    "claude-opus-4-7": ModelConfig(
+        name="anthropic/claude-opus-4-7",
+        short_name="claude-opus-4-7",
+        provider="anthropic",
+    ),
     "claude-opus-4-6": ModelConfig(
         name="anthropic/claude-opus-4-6",
         short_name="claude-opus-4-6",
