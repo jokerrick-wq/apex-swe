@@ -132,8 +132,9 @@ class LayerEvaluator:
         total_tokens_out: int,
         completion_signal: str,
         layers: list[dict],
+        rubric_grading: dict | None = None,
     ) -> None:
-        out = {
+        out: dict = {
             "trial": trial,
             "task": task,
             "model": model,
@@ -144,6 +145,8 @@ class LayerEvaluator:
             "completion_signal": completion_signal,
             "layers": layers,
         }
+        if rubric_grading is not None:
+            out["rubric_grading"] = rubric_grading
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(out, indent=2) + "\n")

@@ -158,3 +158,59 @@ class TestWriteResultsJson:
         assert data["model"] == "claude-opus-4-7"
         assert data["completion_signal"] == "task_complete"
         assert data["layers"] == evaluated
+
+
+def test_write_results_includes_rubric_grading(tmp_path):
+    """write_results must emit rubric_grading when provided."""
+    from common.layers import LayerEvaluator
+
+    evaluator = LayerEvaluator(task_dir=tmp_path, f2p_tests=[], p2p_tests=[])
+    out = tmp_path / "results.json"
+    evaluator.write_results(
+        out,
+        trial=1,
+        task="t1",
+        model="claude-opus-4-7",
+        wall_time_s=1.0,
+        total_cost_usd=0.0,
+        total_tokens_in=0,
+        total_tokens_out=0,
+        completion_signal="task_complete",
+        layers=[],
+        rubric_grading={
+            "passed": 2,
+            "total": 3,
+            "score": 0.667,
+            "per_criterion": [
+                {"id": "x-1", "category": "code_style", "description": "d", "passed": True, "rationale": "r"},
+            ],
+        },
+    )
+    import json as _json
+    data = _json.loads(out.read_text())
+    assert "rubric_grading" in data
+    assert data["rubric_grading"]["passed"] == 2
+    assert data["rubric_grading"]["total"] == 3
+
+
+def test_write_results_omits_rubric_grading_when_none(tmp_path):
+    """Backwards compatibility: existing callers without rubric_grading see no key."""
+    from common.layers import LayerEvaluator
+
+    evaluator = LayerEvaluator(task_dir=tmp_path, f2p_tests=[], p2p_tests=[])
+    out = tmp_path / "results.json"
+    evaluator.write_results(
+        out,
+        trial=1,
+        task="t1",
+        model="m",
+        wall_time_s=0.0,
+        total_cost_usd=0.0,
+        total_tokens_in=0,
+        total_tokens_out=0,
+        completion_signal="task_complete",
+        layers=[],
+    )
+    import json as _json
+    data = _json.loads(out.read_text())
+    assert "rubric_grading" not in data
