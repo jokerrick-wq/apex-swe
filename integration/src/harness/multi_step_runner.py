@@ -842,6 +842,56 @@ class MultiStepRunner:
         if task_logger:
             task_logger.log_evaluation_result(evaluation_result)
 
+        # --- Kosmos: copy proposed solution out of sandbox ---
+        proposed_solution_path = None
+        if docker_manager and task_logger:
+            try:
+                result = docker_manager.exec_command("cat /app/migrate.py", timeout=10)
+                if result.get("exit_code", -1) == 0:
+                    out_path = task_logger.log_dir / "proposed_solution.py"
+                    out_path.write_text(result.get("stdout", ""))
+                    proposed_solution_path = out_path
+                    task_logger._log(f"Captured proposed_solution.py ({out_path.stat().st_size} bytes)")
+            except Exception as e:
+                if task_logger:
+                    task_logger._log(f"Failed to capture migrate.py: {e}")
+
+        # --- Kosmos: run LLM-as-a-judge ---
+        rubric_grading_dict = None
+        rubric_path = task_context.task_dir / "rubric.json"
+        if rubric_path.exists() and proposed_solution_path is not None:
+            try:
+                from common.judge import grade
+                from common.rubric_schema import load_rubric
+                import litellm
+                import os as _os
+
+                def _judge_llm(prompt: str, response_format: str = "json") -> str:
+                    model = _os.environ.get("KOSMOS_JUDGE_MODEL", "claude-opus-4-7")
+                    resp = litellm.completion(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=800,
+                        response_format={"type": "json_object"} if response_format == "json" else None,
+                    )
+                    return resp.choices[0].message.content or ""
+
+                rubric = load_rubric(rubric_path)
+                solution_text = proposed_solution_path.read_text()
+                judge_dir = task_logger.log_dir / "judge-calls"
+                grading = grade(rubric, solution_text, _judge_llm, out_dir=judge_dir)
+                rubric_grading_dict = grading.to_dict()
+                if task_logger:
+                    task_logger._log(
+                        f"Rubric grading: {grading.passed}/{grading.total} "
+                        f"(score={grading.score:.2f})"
+                    )
+            except Exception as e:
+                if task_logger:
+                    task_logger._log(f"Rubric grading failed: {e}")
+
+        execution.metadata["rubric_grading"] = rubric_grading_dict
+
         # Kosmos: write per-trial results.json alongside existing outputs.
         # Coarse first pass — maps aggregate pass/fail onto all F2P/P2P test
         # IDs uniformly. Per-test granularity is a future enhancement once the
@@ -906,6 +956,7 @@ class MultiStepRunner:
                     test_results=_test_results,
                     test_durations_ms=_test_durations,
                     test_errors=_test_errors,
+                    rubric_grading=execution.metadata.get("rubric_grading"),
                 )
             except Exception as _e:
                 if task_logger:
