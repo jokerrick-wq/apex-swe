@@ -628,17 +628,18 @@ def run_agent_sync(
         # The scorer saves to: EVAL_OUTPUTS_DIR/<task_id>/<run_id>/
         agent_diff = ""
         changed_files: list[str] = []
-        
+        run_dir = None
+
         if eval_had_error:
             error_msg = error_msg or "Eval had errors (sandbox or execution failure)"
             task_logger.error(f"Agent execution failed: {error_msg}")
         else:
             # First, try to get the run directory by our run_id
             run_dir = get_run_dir_by_id(task_id, run_id)
-            
+
             if run_dir:
                 agent_diff = get_agent_diff_from_run(run_dir)
-                
+
                 # Try to read changed files from metadata
                 metadata_file = run_dir / "metadata.json"
                 if metadata_file.exists():
@@ -653,7 +654,52 @@ def run_agent_sync(
                 latest_run = get_latest_run_dir(task_id)
                 if latest_run:
                     agent_diff = get_agent_diff_from_run(latest_run)
+                    run_dir = latest_run
                     task_logger.warning(f"Could not find run by ID, using latest run: {latest_run.name}")
+
+        # Kosmos: run LLM-as-a-judge against the agent's unified diff.
+        # Emits <run_dir>/rubric_grading.json and caches per-criterion judge
+        # calls under <run_dir>/judge-calls/ (best-effort — failures don't
+        # abort the agent run).
+        #
+        # This is the observability analog of Task 9's integration hook. Note
+        # that observability's per-trial results.json isn't wired up yet (see
+        # run_e2e.py comment re: Task 16), so rubric_grading is persisted as
+        # a standalone artifact here. write_layer_results_for_trial accepts a
+        # rubric_grading kwarg for when the scorer wiring lands.
+        if run_dir is not None and agent_diff:
+            rubric_path = Path(task_dir) / "rubric.json"
+            if rubric_path.exists():
+                try:
+                    from common.judge import grade
+                    from common.rubric_schema import load_rubric
+                    import litellm
+                    import os as _os
+
+                    def _judge_llm(prompt: str, response_format: str = "json") -> str:
+                        model = _os.environ.get("KOSMOS_JUDGE_MODEL", "claude-opus-4-7")
+                        resp = litellm.completion(
+                            model=model,
+                            messages=[{"role": "user", "content": prompt}],
+                            max_tokens=800,
+                            response_format={"type": "json_object"} if response_format == "json" else None,
+                        )
+                        return resp.choices[0].message.content or ""
+
+                    rubric = load_rubric(rubric_path)
+                    judge_dir = Path(run_dir) / "judge-calls"
+                    grading = grade(rubric, agent_diff, _judge_llm, out_dir=judge_dir)
+                    rubric_grading_dict = grading.to_dict()
+                    (Path(run_dir) / "rubric_grading.json").write_text(
+                        json.dumps(rubric_grading_dict, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    task_logger.info(
+                        f"Rubric grading: {grading.passed}/{grading.total} "
+                        f"(score={grading.score:.2f})"
+                    )
+                except Exception as e:
+                    task_logger.warning(f"Rubric grading failed: {e}")
         
         return AgentRunResult(
             task_id=task_id,

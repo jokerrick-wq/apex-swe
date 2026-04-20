@@ -77,6 +77,7 @@ def write_layer_results_for_trial(
     test_results,
     test_durations_ms,
     test_errors,
+    rubric_grading: dict | None = None,
 ) -> None:
     """Produce trial_dir/results.json using LayerEvaluator.
 
@@ -104,6 +105,7 @@ def write_layer_results_for_trial(
         total_tokens_out=total_tokens_out,
         completion_signal=completion_signal,
         layers=evaluated,
+        rubric_grading=rubric_grading,
     )
 
 
