@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .ask_user_tool import AskUserTool
 from .file_tool import FileTool
 from .terminal_tool import TerminalTool
 from .todo_tool import TodoTool
@@ -19,6 +20,7 @@ class ToolExecutor:
         working_dir: Path | None = None,
         docker_manager=None,
         todo_tool_enabled: bool = False,
+        ask_user_tool: AskUserTool | None = None,
     ):
         """Initialize tool executor."""
         self.working_dir = working_dir or Path.cwd()
@@ -31,9 +33,11 @@ class ToolExecutor:
             else None,
         }
 
-        # Only add todo tool if enabled
         if todo_tool_enabled:
             self.tools["todo"] = TodoTool()
+
+        if ask_user_tool is not None:
+            self.tools["ask_user"] = ask_user_tool
 
         self.execution_history = []
 
@@ -98,6 +102,9 @@ class ToolExecutor:
         """Call a tool that was parsed from content."""
         tool_name = tool_call.get("tool")
 
+        if tool_name == "ask_user":
+            question = tool_call.get("question", "")
+            return self.execute("ask_user", question=question)
         if tool_name == "terminal":
             command = tool_call.get("command", "")
             timeout = tool_call.get("timeout", 120)
@@ -346,6 +353,8 @@ class ToolExecutor:
                         duration = time.time() - exec_start
                         # The first log was already done, this logs completion
                         logger._log(f"Blocking command completed in {duration:.2f}s.")
+                elif tool_name == "ask_user":
+                    result = self.execute("ask_user", question=tool_call.get("question", ""))
                 elif tool_name == "todo":
                     # Extract params excluding 'tool' and 'action'
                     action = tool_call.get("action")
