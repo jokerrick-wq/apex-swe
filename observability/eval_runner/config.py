@@ -1217,10 +1217,21 @@ def check_docker_image_freshness(task_id: str) -> HealthCheckResult:
         image_created = datetime.datetime.fromisoformat(created_raw)
 
         # Find the newest source file under task_dir that the image bakes in.
-        # Skip paths that are bind-mounted at runtime or written during runs — mtime
-        # changes on those don't reflect image staleness.
-        excluded_parts = {"data", "observability", ".git", "__pycache__", ".pytest_cache"}
-        excluded_suffixes = {".log", ".pyc", ".pyo"}
+        # Skip paths that are bind-mounted at runtime or applied at eval time —
+        # mtime changes on those don't reflect image staleness.
+        excluded_parts = {"data", "observability", ".git", "__pycache__", ".pytest_cache", "tests"}
+        excluded_suffixes = {".log", ".pyc", ".pyo", ".patch"}
+        # Specific files consumed by the harness at runtime (not COPY'd in Dockerfile)
+        excluded_names = {
+            "task.yaml",
+            "test_metadata.json",
+            "test_layers.json",
+            "knowledge_base.json",
+            "rubric.json",
+            "probe_battery.json",
+            "out_of_scope_probes.json",
+            "task-spec.md",
+        }
         newest_mtime = 0.0
         newest_file = ""
         if task_dir.exists():
@@ -1231,6 +1242,8 @@ def check_docker_image_freshness(task_id: str) -> HealthCheckResult:
                 if parts & excluded_parts:
                     continue
                 if path.suffix in excluded_suffixes:
+                    continue
+                if path.name in excluded_names:
                     continue
                 try:
                     mtime = path.stat().st_mtime
