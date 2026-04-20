@@ -90,3 +90,28 @@ def test_grade_with_empty_solution_text():
     assert result.total == 2
     assert result.passed == 2
     assert result.score == 1.0
+
+
+def test_grade_isolates_per_criterion_llm_failures():
+    """A single LLM transport failure must not throw away all other criteria."""
+    calls = {"n": 0}
+
+    def flaky(prompt: str, response_format: str = "json") -> str:
+        # The prompt template injects the criterion description (not id); match on that.
+        calls["n"] += 1
+        if "Type hints everywhere" in prompt:
+            raise RuntimeError("simulated 502 from provider")
+        return json.dumps({"passed": True, "rationale": "fine"})
+
+    result = grade(_rubric(), "def foo(): pass", flaky)
+    # Two criteria; one raised, one succeeded.
+    assert len(result.per_criterion) == 2
+    failing = [r for r in result.per_criterion if r.id == "style-001"][0]
+    assert failing.passed is None
+    assert "llm call failed" in failing.rationale
+    passing = [r for r in result.per_criterion if r.id == "readability-001"][0]
+    assert passing.passed is True
+    # Score denominator excludes the failed criterion.
+    assert result.total == 1
+    assert result.passed == 1
+    assert result.score == 1.0

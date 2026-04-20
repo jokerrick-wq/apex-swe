@@ -40,19 +40,37 @@ Describe your plan for the next steps. What commands will you run and why? Be sp
 
     base_prompt += """
 </commands>
-<task_complete>false</task_complete>
 </response>
 
 Required sections:
 - <analysis>: Your analysis of the current situation
-- <plan>: Your plan for the next steps  
-- <commands>: Commands to execute using keystrokes format
+- <plan>: Your plan for the next steps
+- <commands>: Commands to execute using keystrokes format or <tool_use> JSON blocks
 
-Optional sections:
-- <task_complete>: Include this tag if the task is complete. Can be:
-  - <task_complete>true</task_complete> (task complete)
-  - <task_complete>false</task_complete> (task not complete)
-  - If not present, task is assumed not complete
+COMPLETION AND CLARIFICATION TOOLS:
+
+You have two structured tools available via <tool_use> JSON blocks. Use them as needed.
+
+1. ask_user — Ask the task's stakeholder a clarifying question when the prompt is
+   under-specified. A persona-LLM will respond from a fixed knowledge base.
+
+   <tool_use>
+   {"tool":"ask_user","question":"Which S3 bucket should the reconciliation report go to?"}
+   </tool_use>
+
+   Call this any time you are making a non-trivial assumption that changes the outcome.
+   If the persona does not have the answer, you'll get a standard out-of-scope response
+   and should proceed with your best judgment.
+
+2. submit_answer — Signal that you are done. This ends the trial and triggers test
+   evaluation. Call this exactly once, when your solution is ready.
+
+   <tool_use>
+   {"tool":"submit_answer","summary":"Migration script written to /app/migrate.py. Handles pagination, dedup, tier mapping, and S3 retry."}
+   </tool_use>
+
+   Do NOT use <task_complete> — that signal has been removed. Completion is signaled
+   only by calling submit_answer.
 
 COMMAND FORMAT:
 Use the keystrokes format to avoid JSON parsing issues:

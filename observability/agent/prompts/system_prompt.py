@@ -146,7 +146,9 @@ You can use the `search_files` tool to perform regex searches across files in a 
 
 6. **Verify** - Run tests if available (e.g., `npm run type-check`, `npm test`)
 
-7. **Complete** - Use `submit` to indicate task completion
+7. **Complete** - Use `submit_answer` to indicate task completion. You may also call
+   `ask_user(question)` any time the prompt is under-specified; the task stakeholder
+   will respond from a fixed knowledge base.
 
 ====
 
@@ -296,9 +298,15 @@ Track your task progress with a plan.
 - **Parameter:** `steps` (array) - List of step objects with "description" and "status" fields
 - **Status values:** "pending", "in_progress", "completed"
 
-### `submit`
-Submit your solution when the task is complete.
-- **Parameter:** `answer` (string) - Description of what you fixed
+### `submit_answer`
+Submit your solution when the task is complete. Ends the agent loop.
+- **Parameter:** `summary` (string) - Brief description of what you fixed
+
+### `ask_user`
+Ask the task's stakeholder a clarifying question when the prompt is under-specified.
+The persona LLM will answer from a fixed knowledge base or return a standard
+out-of-scope response if the question is outside the persona's disclosure boundaries.
+- **Parameter:** `question` (string) - The clarification question to ask
 
 ====
 

@@ -141,7 +141,18 @@ def grade(
     out_path = Path(out_dir) if out_dir is not None else None
     results: list[CriterionResult] = []
     for criterion in rubric.criteria:
-        results.append(_judge_one(criterion, solution_text, llm_fn, out_path))
+        try:
+            results.append(_judge_one(criterion, solution_text, llm_fn, out_path))
+        except Exception as exc:
+            # LLM transport failure on this criterion (timeout, 429, 502, etc.)
+            # Keep going with the remaining criteria rather than losing all prior work.
+            results.append(CriterionResult(
+                id=criterion.id,
+                category=criterion.category,
+                description=criterion.description,
+                passed=None,
+                rationale=f"llm call failed: {type(exc).__name__}: {exc}",
+            ))
 
     valid = [r for r in results if r.passed is not None]
     passed = sum(1 for r in valid if r.passed)
